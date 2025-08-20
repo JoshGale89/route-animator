@@ -5,8 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "export": "next export",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "build:pages": "set GITHUB_PAGES=true&& npm run build && npm run export"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.7",
