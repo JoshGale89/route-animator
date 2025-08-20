@@ -1,19 +1,21 @@
+// next.config.ts
 import type { NextConfig } from "next";
 
+const repoName = "route-animator";
 const isPages = process.env.GITHUB_PAGES === "true";
 
 const nextConfig: NextConfig = {
-  // Produce a static site in /out
+  /** Build a static site into /out */
   output: "export",
 
-  // GitHub Pages will serve it from /route-animator
-  basePath: isPages ? "/route-animator" : "",
-  assetPrefix: isPages ? "/route-animator/" : "",
+  /** GitHub Pages serves from /<repo>, so set prefixes only in CI */
+  basePath: isPages ? `/${repoName}` : "",
+  assetPrefix: isPages ? `/${repoName}/` : "",
 
-  // If you ever use next/image
+  /** Avoid next/image optimization on static hosts */
   images: { unoptimized: true },
 
-  // Helps avoid nested 404s
+  /** Helps with asset URLs on Pages */
   trailingSlash: true,
 };
 
