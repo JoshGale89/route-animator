@@ -22,8 +22,24 @@ const GlobalCSS = () => (
     .btn { padding:10px 16px; border-radius:10px; border:1px solid rgba(255,255,255,0.18); font-weight:700; cursor:pointer; }
     .btn-primary { background:#22d3ee; color:#08262a; }
     .btn-ghost { background:rgba(255,255,255,0.06); color:#fff; }
-    .panel { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; }
+    /* Adjusted panel styling for better contrast */
+    .panel { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.12); border-radius:16px; padding:16px; }
     .range { accent-color:#22d3ee; }
+
+    /* Responsive tweaks for mobile devices */
+    @media (max-width: 640px) {
+      .group {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .chip, .btn {
+        width: 100%;
+        justify-content: space-between;
+      }
+      .btn {
+        text-align: center;
+      }
+    }
   `}</style>
 );
 
@@ -219,6 +235,85 @@ function calcCenterZoom(samples:ProjPt[], W:number, H:number){
   return { centerLon, centerLat, zoom:0 };
 }
 
+// HUD drawing helper. Draws the statistics (distance, time, pace, climb), elevation strip, and title.
+// Used by both 2D canvas rendering and 3D export. It assumes the canvas is sized W x H and uses
+// current p (0–1) to compute the progress. Does not draw the route itself.
+function drawHud(ctx: CanvasRenderingContext2D, p01: number, W: number, H: number,
+  samples: ProjPt[], units: Units, totalDist: number, totalTimeMs: number,
+  showTitle: boolean, titleText: string, fileName: string, showWeather: boolean,
+  weather: { tempC: number; windKmh: number } | null, showLegend: boolean, splitsOn: boolean,
+  elevGain: number
+) {
+  // Compute top and bottom sizes based on canvas height
+  const hudH = Math.round(H * 0.09);
+  const hudX = Math.round(W * 0.055);
+  const hudY = Math.round(H * 0.02);
+  const hudW = Math.round(W * 0.89);
+  const stripH = Math.round(H * 0.09);
+  const baseY = H - Math.round(stripH * 0.25);
+  const usableH = stripH - Math.round(stripH * 0.55);
+  const stripPad = Math.round(W * 0.08);
+  // Determine metrics at this progress
+  const nowDist = totalDist * p01;
+  const nowMs = totalTimeMs * p01;
+  const msPerKm = totalDist > 0 ? totalTimeMs / (totalDist / 1000) : undefined;
+  // HUD background: dark semi-transparent for legibility on 3D and 2D
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(hudX, hudY, hudW, hudH);
+  // Draw cells
+  const cells = [
+    { label: 'Distance', value: fmtDistByUnits(nowDist, units) },
+    { label: 'Time', value: fmtTime(nowMs) },
+    { label: 'Avg pace', value: fmtPaceByUnits(msPerKm, units) },
+    { label: 'Climb', value: units === 'mph' ? `${Math.round(elevGain * 3.28084)} ft` : `${Math.round(elevGain)} m` },
+  ];
+  const cellW = hudW / cells.length;
+  ctx.textAlign = 'center';
+  const valuePx = Math.round(H * 0.030);
+  const labelPx = Math.round(H * 0.014);
+  cells.forEach((m, i) => {
+    const cx = hudX + i * cellW + cellW / 2;
+    ctx.fillStyle = '#fff';
+    ctx.font = `${valuePx}px ui-sans-serif`;
+    ctx.fillText(m.value, cx, hudY + Math.round(hudH * 0.48));
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = `${labelPx}px ui-sans-serif`;
+    ctx.fillText(m.label, cx, hudY + Math.round(hudH * 0.78));
+  });
+  // Elevation strip background
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(0, H - stripH, W, stripH);
+  // Elevation text
+  ctx.fillStyle = '#fff';
+  ctx.font = `700 ${Math.round(H * 0.018)}px ui-sans-serif`;
+  ctx.fillText('Elevation', Math.round(W * 0.055), H - stripH + Math.round(H * 0.035));
+  // Elevation line
+  const elevs = samples.map((p) => p.ele ?? 0);
+  const minE = Math.min(...elevs);
+  const maxE = Math.max(...elevs);
+  const rng = Math.max(1, maxE - minE);
+  ctx.beginPath();
+  for (let i = 0; i < samples.length; i++) {
+    const px = (i / (samples.length - 1)) * (W - stripPad * 2) + stripPad;
+    const py = baseY - ((elevs[i] - minE) / rng) * usableH;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  // Title
+  if (showTitle) {
+    ctx.font = `600 ${Math.round(H * 0.022)}px ui-sans-serif`;
+    ctx.fillStyle = 'rgba(255,255,255,0.95)';
+    const raw = titleText?.trim() || (fileName ? fileName.replace(/\.[^.]+$/, '') : 'Your Activity');
+    const text = raw.slice(0, 80);
+    const y = H - stripH - Math.round(H * 0.018);
+    const m = ctx.measureText(text);
+    const startX = Math.max(Math.round(W / 2 - m.width / 2), 12);
+    ctx.fillText(text, startX, y);
+  }
+}
 /** ===================== Historical weather (Open-Meteo ERA5) ===================== */
 const isoDate = (ms:number) => new Date(ms).toISOString().slice(0,10);
 function nearestIndexToTime(times:string[], targetMs:number){
@@ -283,6 +378,71 @@ export default function Page() {
   const [bgVidReady, setBgVidReady] = useState(false);
   const [bgTick, setBgTick] = useState(0);
 
+  // Mode: 2D or 3D
+  // Users can toggle between a 2D canvas animation and a 3D Mapbox GL JS preview.
+  type Mode = "2d" | "3d";
+  const [mode, setMode] = useState<Mode>("2d");
+
+  // Map style selection for static images (when using map layout)
+  const [mapStyle, setMapStyle] = useState<string>("streets-v12");
+
+  // Ref to hold base zoom level after fitting the route in 3D.  This is used
+  // during export to keep a consistent zoom when capturing frames.  It is
+  // populated once the 3D map has loaded and fit to bounds.
+  const baseZoomRef = useRef<number | null>(null);
+
+  // Canvas overlay for drawing the HUD on top of the 3D map.  When the 3D
+  // preview is active, this canvas is layered over the map and updated on
+  // each animation frame.  During export of the 3D view, we also draw the
+  // HUD onto the offscreen canvas along with the map image.
+  const hudCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // 3D view controls
+  const [pitch, setPitch] = useState<number>(45);
+  const [bearing, setBearing] = useState<number>(0);
+  const [showTrail, setShowTrail] = useState<boolean>(false);
+
+  // Keep the latest pitch and bearing in refs for use in the animation loop.
+  const pitchRef = useRef(pitch);
+  const bearingRef = useRef(bearing);
+  useEffect(() => { pitchRef.current = pitch; }, [pitch]);
+  useEffect(() => { bearingRef.current = bearing; }, [bearing]);
+
+  // Camera mode for the 3D view.  Different modes change how the camera follows the route.
+  //  - "follow" keeps the camera centered on the marker with the current pitch/bearing.
+  //  - "behind" orients the camera behind the marker, facing the direction of travel.
+  //  - "drone" continuously pans around the marker for an aerial effect.
+  //  - "flyover" begins from a wider zoom and gradually zooms in; currently behaves like follow.
+  // Added 'stationary' camera mode for an overhead, stationary view.
+  const [cameraMode, setCameraMode] = useState<"follow" | "behind" | "drone" | "flyover" | "ground" | "orbit" | "stationary">("follow");
+
+  // Keep showTrail in a ref so the animation loop reads the current value without causing re-renders
+  const showTrailRef = useRef(showTrail);
+  useEffect(() => {
+    showTrailRef.current = showTrail;
+  }, [showTrail]);
+
+  // Keep camera mode in a ref so the animation loop sees updates without reinitializing the map.  This
+  // allows the user to switch camera modes live without tearing down the map instance.
+  const cameraModeRef = useRef(cameraMode);
+  useEffect(() => {
+    cameraModeRef.current = cameraMode;
+  }, [cameraMode]);
+
+  // Keep track of the last heading for smoothing in behind/ground modes
+  const lastHeadingRef = useRef<number>(0);
+
+  // References to the current marker and trail source in the 3D map.  These are populated on map load.
+  const markerRef = useRef<any>(null);
+  const trailRef = useRef<any>(null);
+
+  // Reference for 3D map container and map instance
+  const map3dRef = useRef<any>(null);
+  const mapContainerRef = useRef<HTMLDivElement|null>(null);
+
+  // Error state for 3D map loading
+  const [map3dError, setMap3dError] = useState<string | null>(null);
+
   // Mapbox
   const [mapToken, setMapToken] = useState<string>("pk.eyJ1Ijoiam9zaGc4OSIsImEiOiJjbWVqY21uOXEwYmk5Mmxvb3BmdGN1dGk5In0.RgMUvKwdqQFTqcPOCEEueg");
   const [mapImg, setMapImg] = useState<HTMLImageElement|null>(null);
@@ -311,9 +471,12 @@ export default function Page() {
   // Aspect → canvas size
   const FPS = 30;
   const { W, H, labelSuffix, previewSize } = useMemo(() => {
-    if (aspect==="square") return { W:1080, H:1080, labelSuffix:"1080x1080", previewSize:{ w:480, h:480 } };
-    if (aspect==="wide")   return { W:1920, H:1080, labelSuffix:"1920x1080", previewSize:{ w:640, h:360 } };
-    return { W:1080, H:1920, labelSuffix:"1080x1920", previewSize:{ w:360, h:640 } };
+    // Define intrinsic resolutions and preview sizes based on aspect ratio.
+    // Reduced preview sizes for a more compact layout.
+    if (aspect === "square") return { W: 1080, H: 1080, labelSuffix: "1080x1080", previewSize: { w: 420, h: 420 } };
+    if (aspect === "wide")   return { W: 1920, H: 1080, labelSuffix: "1920x1080", previewSize: { w: 560, h: 315 } };
+    // default to vertical
+    return { W: 1080, H: 1920, labelSuffix: "1080x1920", previewSize: { w: 330, h: 610 } };
   }, [aspect]);
 
   // Derived
@@ -352,6 +515,19 @@ export default function Page() {
     return { lo, hi, loU:toUnits(lo,units), hiU:toUnits(hi,units) };
   }, [speedsMS, units]);
 
+  // Total elevation gain (sum of positive climbs) across the entire activity
+  const elevGain = useMemo(() => {
+    if (!samples.length) return 0;
+    let gain = 0;
+    for (let i = 1; i < samples.length; i++) {
+      const prev = samples[i - 1];
+      const cur = samples[i];
+      const diff = (cur.ele ?? 0) - (prev.ele ?? 0);
+      if (diff > 0) gain += diff;
+    }
+    return gain;
+  }, [samples]);
+
   /** ---------- Legend rect ---------- */
   function legendRect() {
     const legendW = Math.round(W*0.14);
@@ -371,8 +547,12 @@ export default function Page() {
 
   /** ===================== Draw ===================== */
   const drawFrame = (progress01:number) => {
-    const cvs=canvasRef.current!; cvs.width=W; cvs.height=H;
-    const ctx=cvs.getContext("2d")!; ctx.clearRect(0,0,W,H);
+    const cvs=canvasRef.current;
+    if(!cvs) return; // hydration guard: bail if canvas is not ready
+    cvs.width=W; cvs.height=H;
+    const ctx=cvs.getContext("2d");
+    if(!ctx) return;
+    ctx.clearRect(0,0,W,H);
 
     // Backgrounds
     if (layout==="transparent") {
@@ -428,12 +608,24 @@ export default function Page() {
     }
 
     // Layout metrics + projector
-    const hudH = Math.round(H*0.12);
-    const stripH = Math.round(H*0.12);
+    // Reserve space at the top for a stats panel (HUD) and at the bottom for the elevation strip
+    const hudHeight = Math.round(H * 0.12);
+    const stripHeight = Math.round(H * 0.12);
     const sidePad = Math.round(Math.min(W,H)*0.08);
-    const projector = makeProjector(samples, W, H,
-      { left:sidePad, right:sidePad, top:Math.round(H*0.03)+hudH+16, bottom:stripH+16 },
-      pan, zoom
+    const projector = makeProjector(
+      samples,
+      W,
+      H,
+      {
+        left: sidePad,
+        right: sidePad,
+        // Top padding includes a small margin, the HUD height and extra spacing
+        top: Math.round(H * 0.03) + hudHeight + 16,
+        // Bottom padding includes the elevation strip height plus spacing
+        bottom: stripHeight + 16,
+      },
+      pan,
+      zoom,
     );
 
     const upto = Math.max(1, Math.floor(progress01*(samples.length-1)));
@@ -467,40 +659,26 @@ export default function Page() {
       ctx.stroke();
     }
 
-    // Splits (labels + celebratory pulse)
-    if (splitsOn && totalDist>0) {
-      const unit = units==="mph" ? 1609.344 : 1000;
-      ctx.fillStyle = layout==="paper" ? "#000" : "#fff";
-      ctx.font = `600 ${Math.round(H*0.022)}px ui-sans-serif`;
-      for (let m=unit, n=1; m<totalDist; m+=unit, n++){
-        let idx=samples.findIndex(s=>s.d>=m); if (idx<0) idx=samples.length-1;
-        const {x,y}=projector.toXY(samples[idx]);
-        ctx.beginPath(); ctx.arc(x,y,Math.max(8,Math.round(Math.min(W,H)*0.012)),0,Math.PI*2); ctx.fill();
-        const lab = units==="mph" ? `${n} mi` : `${n} km`;
-        ctx.fillText(lab, x+10, y-10);
+    // Splits (mile/km markers).  Draw small markers and labels, but remove the celebratory pulse animation.
+    if (splitsOn && totalDist > 0) {
+      const unit = units === "mph" ? 1609.344 : 1000;
+      ctx.fillStyle = layout === "paper" ? "#000" : "#fff";
+      ctx.font = `600 ${Math.round(H * 0.022)}px ui-sans-serif`;
+      for (let m = unit, n = 1; m < totalDist; m += unit, n++) {
+        let idx = samples.findIndex((s) => s.d >= m);
+        if (idx < 0) idx = samples.length - 1;
+        const { x, y } = projector.toXY(samples[idx]);
+        // Small filled circle at the split point
+        // Use a thinner marker radius so it doesn't dominate the view
+        const rad = Math.max(4, Math.round(Math.min(W, H) * 0.005));
+        ctx.beginPath();
+        ctx.arc(x, y, rad, 0, Math.PI * 2);
+        ctx.fill();
+        // Label slightly offset
+        const lab = units === "mph" ? `${n} mi` : `${n} km`;
+        ctx.fillText(lab, x + 8, y - 8);
       }
-      // celebratory pulse
-      const pulseWindowFrames = Math.round(0.5*30);
-      ctx.strokeStyle="#22d3ee";
-      for (let n=0;n<splitIdxs.length;n++){
-        const si=splitIdxs[n], df=Math.abs(upto-si);
-        if (df<=pulseWindowFrames){
-          const k=1-df/pulseWindowFrames, ease=1-Math.pow(1-k,2);
-          const {x,y}=projector.toXY(samples[si]);
-          ctx.lineWidth=Math.max(3,Math.round(Math.min(W,H)*0.012));
-          ctx.shadowColor="#22d3ee"; ctx.shadowBlur=Math.round(Math.min(W,H)*0.02);
-          ctx.beginPath();
-          ctx.arc(x,y,Math.max(18,Math.round(Math.min(W,H)*0.04))*(1+0.8*ease),0,Math.PI*2);
-          ctx.stroke(); ctx.shadowBlur=0;
-          // sparks
-          const sparks=12;
-          for (let s=0;s<sparks;s++){
-            const ang=(s/sparks)*Math.PI*2; const len=Math.round(Math.min(W,H)*(0.02+0.03*ease));
-            ctx.beginPath(); ctx.moveTo(x+Math.cos(ang)*len*0.6, y+Math.sin(ang)*len*0.6);
-            ctx.lineTo(x+Math.cos(ang)*len, y+Math.sin(ang)*len); ctx.stroke();
-          }
-        }
-      }
+      // Removed celebratory pulse and sparks to avoid early triggering and heavy visuals
     }
 
     // Progress comet head
@@ -514,36 +692,77 @@ export default function Page() {
     const {x:cx,y:cy}=projector.toXY(uptoPt);
     ctx.fillStyle="#22d3ee"; ctx.beginPath(); ctx.arc(cx,cy,Math.max(10,Math.round(Math.min(W,H)*0.017)),0,Math.PI*2); ctx.fill();
 
-    // HUD panel color (darker on light layouts)
-    const hudBg =
-      layout==="paper" || layout==="map"
-        ? "rgba(0,0,0,0.28)" // ✅ darker on light backgrounds
-        : "rgba(255,255,255,0.06)";
+    // HUD panel color: provide a semi-transparent dark backdrop on all layouts for legibility
+    const hudBg = "rgba(0,0,0,0.35)";
 
-    // HUD top
-    const hudY = Math.round(H*0.03);
+    // HUD top (stats panel)
+    const hudX = Math.round(W * 0.055);
+    const hudY = Math.round(H * 0.03);
+    const hudW = Math.round(W * 0.89);
+    const hudH = Math.round(H * 0.12);
+    // Draw HUD background
     ctx.fillStyle = hudBg;
-    ctx.fillRect(Math.round(W*0.055), hudY, Math.round(W*0.89), Math.round(H*0.12));
-
-    ctx.fillStyle = layout==="paper" ? "#f3f3f3" : "#fff";
-    ctx.font = `700 ${Math.round(H*0.033)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    ctx.fillRect(hudX, hudY, hudW, hudH);
+    // Compute dynamic metrics
     const elapsed = totalTimeMs * progress01;
     const distNow = totalDist * progress01;
     const curPace = smoothedPaceAt(samples, upto, 8);
-    ctx.fillText(`${fmtDistByUnits(distNow, units)}  •  ${fmtTime(elapsed)}`, Math.round(W*0.08), Math.round(H*0.085));
-
-    ctx.font = `500 ${Math.round(H*0.024)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-    ctx.fillStyle = layout==="paper" ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.9)";
-    ctx.fillText(`Pace: ${fmtPaceByUnits(curPace, units)}   •   Total: ${fmtDistByUnits(totalDist, units)} in ${fmtTime(totalTimeMs)}`, Math.round(W*0.08), Math.round(H*0.115));
-
-    // Weather (right)
-    if (showWeather && weather){
-      const t = units==="mph" ? Math.round(weather.tempC*9/5+32) : Math.round(weather.tempC);
-      const w = units==="mph" ? Math.round(weather.windKmh/1.609344) : Math.round(weather.windKmh);
-      ctx.textAlign="right"; ctx.fillStyle = layout==="paper" ? "#f3f3f3" : "#fff";
-      ctx.font = `600 ${Math.round(H*0.022)}px ui-sans-serif`;
-      ctx.fillText(`🌡 ${t}${units==="mph"?"°F":"°C"}  •  💨 ${w} ${units==="mph"?"mph":"km/h"}`, W - Math.round(W*0.08), Math.round(H*0.085));
-      ctx.textAlign="left";
+    // Compute current elevation gain up to this frame
+    let curElevGain = 0;
+    for (let i = 1; i <= upto; i++) {
+      const prev = samples[i - 1];
+      const cur = samples[i];
+      const diff = (cur.ele ?? 0) - (prev.ele ?? 0);
+      if (diff > 0) curElevGain += diff;
+    }
+    const curElevStr = units === "mph"
+      ? `${Math.round(curElevGain * 3.28084)} ft`
+      : `${Math.round(curElevGain)} m`;
+    // Compose metric objects
+    const metrics = [
+      { label: "Distance", value: fmtDistByUnits(distNow, units) },
+      { label: "Time", value: fmtTime(elapsed) },
+      { label: "Pace", value: fmtPaceByUnits(curPace, units) },
+      { label: "Climb", value: curElevStr },
+    ];
+    // Draw each metric in its own cell
+    const cellW = hudW / metrics.length;
+    ctx.textAlign = "center";
+    metrics.forEach((m, i) => {
+      const cxPos = hudX + i * cellW + cellW / 2;
+      // Value (big)
+      ctx.fillStyle = layout === "paper" ? "#111" : "#fff";
+      ctx.font = `${Math.round(H * 0.035)}px ui-sans-serif`;
+      ctx.fillText(m.value, cxPos, hudY + Math.round(hudH * 0.45));
+      // Label (small)
+      ctx.fillStyle = layout === "paper" ? "rgba(0,0,0,0.7)" : "rgba(255,255,255,0.75)";
+      ctx.font = `${Math.round(H * 0.016)}px ui-sans-serif`;
+      ctx.fillText(m.label, cxPos, hudY + Math.round(hudH * 0.75));
+    });
+    // Compose total metrics row
+    const totDistStr = fmtDistByUnits(totalDist, units);
+    const totTimeStr = fmtTime(totalTimeMs);
+    const totElevStr = units === "mph"
+      ? `${Math.round(elevGain * 3.28084)} ft`
+      : `${Math.round(elevGain)} m`;
+    // Average pace over entire activity (minutes per km)
+    const totPaceMinPerKm = totalDist > 0 ? (totalTimeMs / 60000) / (totalDist / 1000) : undefined;
+    const totPaceStr = fmtPaceByUnits(totPaceMinPerKm, units);
+    const totRow = `Total: ${totDistStr} in ${totTimeStr}  •  Avg pace: ${totPaceStr}  •  Elev: ${totElevStr}`;
+    ctx.fillStyle = layout === "paper" ? "rgba(0,0,0,0.7)" : "rgba(255,255,255,0.7)";
+    ctx.font = `${Math.round(H * 0.014)}px ui-sans-serif`;
+    ctx.fillText(totRow, hudX + hudW / 2, hudY + Math.round(hudH * 0.96));
+    ctx.textAlign = "left";
+    // Weather (right) overlay (still fits inside HUD). Position near top right of HUD.
+    if (showWeather && weather) {
+      const tVal = units === "mph" ? Math.round(weather.tempC * 9/5 + 32) : Math.round(weather.tempC);
+      const wVal = units === "mph" ? Math.round(weather.windKmh / 1.609344) : Math.round(weather.windKmh);
+      const wxStr = `🌡 ${tVal}${units === "mph" ? "°F" : "°C"}  •  💨 ${wVal} ${units === "mph" ? "mph" : "km/h"}`;
+      ctx.textAlign = "right";
+      ctx.fillStyle = layout === "paper" ? "#111" : "#fff";
+      ctx.font = `${Math.round(H * 0.022)}px ui-sans-serif`;
+      ctx.fillText(wxStr, hudX + hudW - Math.round(W * 0.02), hudY + Math.round(hudH * 0.35));
+      ctx.textAlign = "left";
     }
 
     // Mini speed legend
@@ -676,19 +895,271 @@ export default function Page() {
     run();
   }, [showWeather, samples]);
 
-  /** ===================== Map static image ===================== */
-  useEffect(()=>{
-    const load = async ()=>{
-      if (layout!=="map" || !samples.length || !mapToken) { setMapImg(null); return; }
-      const { centerLat, centerLon, zoom } = calcCenterZoom(samples, W, H);
-      const MAX=1280, scale=Math.min(MAX/W, MAX/H, 1);
-      const reqW=Math.max(200, Math.round(W*scale)), reqH=Math.max(200, Math.round(H*scale));
-      const url = `https://api.mapbox.com/styles/v1/mapbox/outdoors-v12/static/${centerLon},${centerLat},${zoom},0,0/${reqW}x${reqH}?access_token=${encodeURIComponent(mapToken)}&attribution=false&logo=false`;
-      const img=new Image(); img.crossOrigin="anonymous";
-      img.onload=()=>setMapImg(img); img.onerror=()=>setMapImg(null); img.src=url;
+  /** ===================== 3D map initialization and updates ===================== */
+  useEffect(() => {
+    // Only initialize in 3D mode with samples and a token
+    if (mode !== '3d' || !samples.length || !mapToken) {
+      if (map3dRef.current) {
+        try { map3dRef.current.remove(); } catch {}
+        map3dRef.current = null;
+      }
+      return;
+    }
+    let cancelled = false;
+    let animId: number | null = null;
+    (async () => {
+      try {
+        const mapboxgl = (await import('mapbox-gl')).default as any;
+        mapboxgl.accessToken = mapToken;
+        // Destroy any existing map
+        if (map3dRef.current) {
+          try { map3dRef.current.remove(); } catch {}
+          map3dRef.current = null;
+        }
+        // Create map instance
+        const map = new mapboxgl.Map({
+          container: mapContainerRef.current!,
+          style: `mapbox://styles/mapbox/${mapStyle || 'streets-v12'}`,
+          antialias: true,
+          preserveDrawingBuffer: true,
+        });
+        map3dRef.current = map;
+        map.addControl(new mapboxgl.NavigationControl());
+        map.on('load', () => {
+          if (cancelled) return;
+          map.resize();
+          try { map.setProjection('mercator'); } catch {}
+          // DEM terrain
+          if (!map.getSource('mapbox-dem')) {
+            map.addSource('mapbox-dem', { type: 'raster-dem', url: 'mapbox://mapbox.mapbox-terrain-dem-v1', tileSize: 512, maxzoom: 14 });
+            map.setTerrain({ source: 'mapbox-dem', exaggeration: 1.2 });
+          }
+          // Sky layer
+          if (!map.getLayer('sky')) {
+            map.addLayer({ id: 'sky', type: 'sky', paint: { 'sky-type': 'atmosphere' } });
+          }
+          const coords: [number, number][] = samples.map((p) => [p.x, p.y]);
+          // Route source & layer
+          if (map.getSource('route')) {
+            (map.getSource('route') as any).setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: coords } });
+          } else {
+            map.addSource('route', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'LineString', coordinates: coords } } });
+          }
+          if (!map.getLayer('route-line')) {
+            map.addLayer({ id: 'route-line', type: 'line', source: 'route', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#22d3ee', 'line-width': 5, 'line-opacity': 0.95 } });
+          }
+          // Trail source & layer
+          if (!map.getSource('trail')) {
+            // Initialize the trail as an empty GeoJSON line. It will be updated every frame when showTrailRef.current is true.
+            map.addSource('trail', {
+              type: 'geojson',
+              data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } }
+            });
+          }
+          if (!map.getLayer('trail-line')) {
+            // Use a lighter colour and thinner width for the trail so it is distinct from the main route.
+            map.addLayer({
+              id: 'trail-line',
+              type: 'line',
+              source: 'trail',
+              layout: { 'line-cap': 'round', 'line-join': 'round' },
+              paint: {
+                'line-color': '#fbbf24',
+                'line-width': 4,
+                'line-opacity': 0.6
+              }
+            });
+          }
+          // Fit bounds and clamp zoom
+          const lons = samples.map((s) => s.x), lats = samples.map((s) => s.y);
+          const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+          const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+          const bounds = new (mapboxgl as any).LngLatBounds([minLon, minLat], [maxLon, maxLat]);
+          map.fitBounds(bounds, { padding: 60, duration: 0 });
+          map.once('moveend', () => {
+            const minZoom = 12;
+            if (map.getZoom() < minZoom) map.easeTo({ zoom: minZoom, duration: 0 });
+            baseZoomRef.current = map.getZoom();
+            try { map.setPitch(pitch); map.setBearing(bearing); } catch {}
+          });
+          // Marker & refs
+          // Marker to represent the moving athlete: use a warm color to contrast the route and buildings
+          const marker = new mapboxgl.Marker({ color: '#f97316' }).setLngLat(coords[0]).addTo(map);
+          markerRef.current = marker;
+          trailRef.current = map.getSource('trail');
+          // Grab HUD canvas context
+          const hudCanvas = hudCanvasRef.current;
+          const hudCtx = hudCanvas ? hudCanvas.getContext('2d') : null;
+          // Animation variables
+          let frame = 0;
+          const totalFrames = Math.max(2, Math.round(FPS * durationSec));
+          let droneAngle = 0;
+          // Precompute route bounding box center for orbit mode
+          const centerLonLat: [number, number] = [ (minLon + maxLon) / 2, (minLat + maxLat) / 2 ];
+          const animate = () => {
+            if (cancelled || mode !== '3d') return;
+            frame = (frame + 1) % totalFrames;
+            const idx = Math.min(samples.length - 1, Math.floor((frame / totalFrames) * samples.length));
+            const curr = coords[idx];
+            // update marker position
+            marker.setLngLat(curr);
+            // update trail using ref
+            if (showTrailRef.current && trailRef.current) {
+              const sub = coords.slice(0, idx + 1);
+              (trailRef.current as any).setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: sub } });
+            } else if (trailRef.current) {
+              (trailRef.current as any).setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
+            }
+            // camera modes
+            const cm = cameraModeRef.current;
+            if (cm === 'behind' || cm === 'ground') {
+              // compute heading to next point and smooth it
+              const nextIdx = Math.min(samples.length - 1, idx + 1);
+              const next = coords[nextIdx];
+              const currLon = curr[0], currLat = curr[1];
+              const nextLon = next[0], nextLat = next[1];
+              const dx = (nextLon - currLon) * Math.cos((currLat * Math.PI) / 180);
+              const dy = nextLat - currLat;
+              let rawHeading = Math.atan2(dx, dy) * 180 / Math.PI;
+              if (rawHeading < 0) rawHeading += 360;
+              const prev = lastHeadingRef.current ?? rawHeading;
+              let delta = rawHeading - prev;
+              if (delta > 180) delta -= 360;
+              if (delta < -180) delta += 360;
+              // Smooth the heading changes to avoid jitter. Using a smaller factor slows down rapid swings.
+              const smoothed = prev + delta * 0.05;
+              lastHeadingRef.current = smoothed;
+              if (cm === 'ground') {
+                // ground: high pitch, ensure high zoom; extend duration for smoother motion
+                const gz = Math.max(baseZoomRef.current ?? map.getZoom(), 16);
+                map.easeTo({ center: curr as any, bearing: smoothed, pitch: 80, zoom: gz, duration: 300 });
+              } else {
+                // behind: medium pitch; slightly longer duration for smoother transitions
+                map.easeTo({ center: curr as any, bearing: smoothed, pitch: 45, zoom: baseZoomRef.current ?? map.getZoom(), duration: 250 });
+              }
+            } else if (cm === 'drone') {
+              droneAngle += 0.5;
+              map.easeTo({ center: curr as any, bearing: droneAngle, pitch: 60, zoom: baseZoomRef.current ?? map.getZoom(), duration: 200 });
+            } else if (cm === 'flyover') {
+              const progress = frame / totalFrames;
+              const startPitch = 75;
+              const endPitch = 45;
+              const thisPitch = startPitch - (startPitch - endPitch) * progress;
+              map.easeTo({ center: curr as any, bearing: map.getBearing(), pitch: thisPitch, zoom: baseZoomRef.current ?? map.getZoom(), duration: 200 });
+            } else if (cm === 'orbit') {
+              const progress = frame / totalFrames;
+              const zoomStart = (baseZoomRef.current ?? map.getZoom()) - 2;
+              const zoomEnd = baseZoomRef.current ?? map.getZoom();
+              const zoomNow = zoomStart + (zoomEnd - zoomStart) * progress;
+              const pitchStart = 80;
+              const pitchEnd = 45;
+              const pitchNow = pitchStart - (pitchStart - pitchEnd) * progress;
+              const bearingNow = 360 * progress;
+              map.easeTo({ center: centerLonLat as any, zoom: zoomNow, pitch: pitchNow, bearing: bearingNow, duration: 200 });
+            } else if (cm === 'stationary') {
+              // Stationary: keep view over the route center with user-defined pitch and bearing
+              const z = baseZoomRef.current ?? map.getZoom();
+              map.easeTo({ center: centerLonLat as any, bearing: bearingRef.current, pitch: pitchRef.current, zoom: z, duration: 200 });
+            } else {
+              // Follow: center on current point using current pitch/bearing
+              map.easeTo({ center: curr as any, bearing: bearingRef.current, pitch: pitchRef.current, zoom: baseZoomRef.current ?? map.getZoom(), duration: 200 });
+            }
+            // draw HUD overlay
+            if (hudCtx && hudCanvas) {
+              hudCanvas.width = previewSize.w;
+              hudCanvas.height = previewSize.h;
+              hudCtx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
+              const p = (samples.length > 1 ? idx / (samples.length - 1) : 0);
+              hudCtx.save();
+              hudCtx.scale(previewSize.w / W, previewSize.h / H);
+              drawHud(hudCtx as any, p, W, H, samples, units, totalDist, totalTimeMs, showTitle, titleText, fileName, showWeather, weather, showLegend, splitsOn, elevGain);
+              hudCtx.restore();
+            }
+            animId = requestAnimationFrame(animate);
+          };
+          animId = requestAnimationFrame(animate);
+        });
+      } catch (err: any) {
+        console.warn(err);
+        setMap3dError('Failed to load 3D map. Make sure mapbox-gl is installed.');
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (animId != null) cancelAnimationFrame(animId);
+      if (map3dRef.current) {
+        try { map3dRef.current.remove(); } catch {}
+        map3dRef.current = null;
+      }
     };
-    load();
-  }, [layout, samples, W, H, mapToken]);
+  }, [mode, samples, mapToken, mapStyle, durationSec]);
+
+  // Update pitch and bearing on the existing 3D map when they change
+  useEffect(() => {
+    const map = map3dRef.current;
+    if (map && mode === '3d') {
+      try {
+        map.setPitch(pitch);
+        map.setBearing(bearing);
+      } catch {}
+    }
+  }, [pitch, bearing, mode]);
+
+  /** ===================== Map static image ===================== */
+  // ===================== Map static image =====================
+useEffect(() => {
+  const load = async () => {
+    if (layout !== "map" || !samples.length || !mapToken) {
+      setMapImg(null);
+      return;
+    }
+    // compute bbox
+    const lons = samples.map(s => s.x), lats = samples.map(s => s.y);
+    let minLon = Math.min(...lons), maxLon = Math.max(...lons);
+    let minLat = Math.min(...lats), maxLat = Math.max(...lats);
+
+    // pad bbox ~1% to avoid cropping
+    const padLon = (maxLon - minLon || 0.001) * 0.01;
+    const padLat = (maxLat - minLat || 0.001) * 0.01;
+    minLon -= padLon; maxLon += padLon;
+    minLat -= padLat; maxLat += padLat;
+
+    // Mapbox static with bbox
+    const MAX = 1280, scale = Math.min(MAX / W, MAX / H, 1);
+    const reqW = Math.max(200, Math.round(W * scale));
+    const reqH = Math.max(200, Math.round(H * scale));
+    const bbox = `[${minLon},${minLat},${maxLon},${maxLat}]`;
+    // Use the selected style for static backgrounds.  Default to outdoors-v12 if none selected.
+    const styleId = mapStyle || 'outdoors-v12';
+    const base = `https://api.mapbox.com/styles/v1/mapbox/${styleId}/static`;
+    const url =
+      `${base}/${bbox}/${reqW}x${reqH}` +
+      `?padding=24&attribution=false&logo=false&access_token=${encodeURIComponent(mapToken)}`;
+
+    const img = new Image();
+    // important: don't set crossOrigin; allow a straightforward load
+    img.onload = () => setMapImg(img);
+    img.onerror = () => {
+      // fallback to auto with overlay (if bbox fails)
+      try {
+        const coords = samples.map(p => `${p.x},${p.y}`).join(";");
+        const path = `path-5+22d3ee-0.8(${coords})`;
+        const autoUrl =
+          `${base}/${path}/auto/${reqW}x${reqH}` +
+          `?padding=24&attribution=false&logo=false&access_token=${encodeURIComponent(mapToken)}`;
+        const img2 = new Image();
+        img2.onload = () => setMapImg(img2);
+        img2.onerror = () => setMapImg(null);
+        img2.src = autoUrl;
+      } catch {
+        setMapImg(null);
+      }
+    };
+    img.src = url;
+  };
+  load();
+}, [layout, samples, W, H, mapToken, mapStyle]);
+
 
   /** ===================== Pointer & click ===================== */
   function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -852,11 +1323,24 @@ export default function Page() {
 
   /** ===================== UI ===================== */
   return (
-    <main style={{ minHeight:"100vh", background:"#0b0f14", color:"#fff", fontFamily:"ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto" }}>
+    <main style={{ minHeight:"100vh", background:"#0f1216", color:"#fff", fontFamily:"ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto" }}>
       <GlobalCSS />
       <div style={{ maxWidth:1100, margin:"0 auto", padding:"32px 20px 120px" }}>
         <h1 style={{ fontSize:28, fontWeight:700 }}>Route Animator (MVP)</h1>
-        <p style={{ opacity:0.9, marginTop:4 }}>Upload a GPX, preview (click to pause/resume), drag to pan, zoom, choose layout (Night Grid by default), export MP4.</p>
+        <p style={{ opacity:0.9, marginTop:4 }}>Upload a GPX, preview (click to pause/resume), drag to pan, zoom, choose layout (Night Grid by default), export MP4. Toggle between 2D and experimental 3D modes.</p>
+
+        {/* Mode toggle */}
+        <h3 style={{ marginTop:16, marginBottom:6, opacity:0.8, fontWeight:600 }}>Mode</h3>
+        <div className="group">
+          <label className="chip">
+            <input type="radio" name="mode" checked={mode === '2d'} onChange={() => setMode('2d')} />
+            <span>2D</span>
+          </label>
+          <label className="chip">
+            <input type="radio" name="mode" checked={mode === '3d'} onChange={() => setMode('3d')} />
+            <span>3D (beta)</span>
+          </label>
+        </div>
 
         {/* File */}
         <h3 style={{ marginTop:16, marginBottom:6, opacity:0.8, fontWeight:600 }}>File</h3>
@@ -889,146 +1373,228 @@ export default function Page() {
             </select>
           </div>
 
-          <button className="btn btn-ghost" onClick={()=>{ setPan({x:0,y:0}); setZoom(1); }}>Reset position</button>
+          {/* Reset only relevant for 2D canvas */}
+          {mode === '2d' && (
+            <button className="btn btn-ghost" onClick={()=>{ setPan({x:0,y:0}); setZoom(1); }}>Reset position</button>
+          )}
         </div>
 
-        {/* Visual */}
-        <h3 style={{ marginTop:18, marginBottom:6, opacity:0.8, fontWeight:600 }}>Visual</h3>
-        <div className="group">
-          <div className="chip">
-            <span>Layout</span>
-            <select value={layout} onChange={(e)=>setLayout(e.target.value as Layout)}>
-              <option value="grid">Night grid</option>
-              <option value="minimal">Minimal dark</option>
-              <option value="paper">Paper topo</option>
-              <option value="transparent">Transparent (upload bg)</option>
-              <option value="map">Map (Mapbox static)</option>
-            </select>
+        {/* Preview / 3D View */}
+        {mode === '2d' ? (
+          <div className="panel" style={{ marginTop:16, display:"grid", placeItems:"center" }}>
+            <canvas
+              ref={canvasRef}
+              width={W}
+              height={H}
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerLeave={onPointerUp}
+              onClick={onCanvasClick}
+              style={{ width: previewSize.w, height: previewSize.h, borderRadius: 12, cursor: "grab", maxWidth: "100%" }}
+            />
+            <p style={{ marginTop:10, opacity:0.7 }}>Preview (click to {pausedRef.current ? "play" : "pause"}, drag to reposition, use Zoom). Export is {labelSuffix}.</p>
           </div>
+        ) : (
+          <div className="panel" style={{ marginTop:16 }}>
+            {/* Map container with overlay canvas */}
+            <div style={{ position:'relative', width: previewSize.w, height: previewSize.h, borderRadius: 12, maxWidth:'100%', overflow:'hidden' }}>
+              <div
+                ref={mapContainerRef}
+                style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%' }}
+              />
+              <canvas
+                ref={hudCanvasRef}
+                style={{ position:'absolute', top:0, left:0, width:'100%', height:'100%', pointerEvents:'none' }}
+              />
+            </div>
+            {/* 3D Controls */}
+            <div className="group" style={{ marginTop:12 }}>
+              <div className="chip" style={{ gap:12 }}>
+                <span>Pitch</span>
+                <input className="range" type="range" min={0} max={60} step={1} value={pitch} onChange={(e)=>setPitch(parseFloat(e.target.value))} />
+              </div>
+              <div className="chip" style={{ gap:12 }}>
+                <span>Bearing</span>
+                <input className="range" type="range" min={0} max={360} step={1} value={bearing} onChange={(e)=>setBearing(parseFloat(e.target.value))} />
+              </div>
+              <label className="chip"><input type="checkbox" checked={showTrail} onChange={(e)=>setShowTrail(e.target.checked)} /><span>Trailing line</span></label>
 
-          <div className="chip" style={{ gap:12 }}>
-            <span>Zoom</span>
-            <input className="range" type="range" min={0.5} max={2} step={0.05} value={zoom} onChange={(e)=>setZoom(parseFloat(e.target.value))} />
-          </div>
-
-          <label className="chip"><input type="checkbox" checked={highContrastRoute} onChange={(e)=>setHighContrastRoute(e.target.checked)} /><span>High-contrast route</span></label>
-
-          {layout==="transparent" && (
-            <>
+              {/* Camera mode selector */}
               <div className="chip">
-                <span>Background</span>
-                <select value={bgKind} onChange={(e)=>setBgKind(e.target.value as any)}>
-                  <option value="none">None</option><option value="image">Image</option><option value="video">Video</option>
+                <span>Camera</span>
+                <select value={cameraMode} onChange={(e) => setCameraMode(e.target.value as any)}>
+                  <option value="follow">Follow</option>
+                  <option value="behind">Behind</option>
+                  <option value="drone">Drone</option>
+                  <option value="flyover">Flyover</option>
+                  <option value="ground">Ground</option>
+                  <option value="orbit">Orbit</option>
+                  <option value="stationary">Stationary</option>
                 </select>
               </div>
-              {bgKind==="image" && (
-                <label className="chip" style={{ cursor:"pointer" }}>
-                  <input type="file" accept="image/*" style={{ display:"none" }}
-                    onChange={(e)=>{
-                      const f=e.target.files?.[0]; if(!f) return;
-                      const url=URL.createObjectURL(f);
-                      const img=new Image();
-                      img.onload=()=>{ bgImgRef.current=img; setBgTick(t=>t+1); };
-                      img.src=url;
-                    }} />
-                  <span>Upload image</span>
-                </label>
-              )}
-              {bgKind==="video" && (
-                <label className="chip" style={{ cursor:"pointer" }}>
-                  <input type="file" accept="video/*" style={{ display:"none" }}
-                    onChange={(e)=>{
-                      const f=e.target.files?.[0]; if(!f) return;
-                      const url=URL.createObjectURL(f);
-                      const v=document.createElement("video");
-                      v.src=url; v.crossOrigin="anonymous"; v.muted=true; v.loop=true; v.playsInline=true;
-                      v.onloadeddata=()=>{ bgVidRef.current=v; setBgVidReady(true); setBgTick(t=>t+1); v.play().catch(()=>{}); };
-                    }} />
-                  <span>Upload video</span>
-                </label>
-              )}
-              <div className="chip" style={{ gap:12 }}>
-                <span>Background transparency</span>
-                <input className="range" type="range" min={0} max={1} step={0.05} value={bgAlpha} onChange={(e)=>setBgAlpha(parseFloat(e.target.value))} />
+              {/* Map style selector in 3D */}
+              <div className="chip">
+                <span>Style</span>
+                <select value={mapStyle} onChange={(e) => setMapStyle(e.target.value)}>
+                  <option value="streets-v12">Streets</option>
+                  <option value="outdoors-v12">Outdoors</option>
+                  <option value="satellite-streets-v12">Satellite streets</option>
+                  <option value="satellite-v9">Satellite</option>
+                  <option value="light-v11">Light</option>
+                  <option value="dark-v11">Dark</option>
+                  <option value="standard">Standard</option>
+                  <option value="standard-satellite">Standard Satellite</option>
+                </select>
               </div>
-            </>
-          )}
-
-          {layout==="map" && (
-            <>
-              <input type="text" className="chip" style={{ minWidth:340, background:"rgba(255,255,255,0.06)", color:"#fff" }}
-                     value={mapToken} onChange={(e)=>setMapToken(e.target.value)} placeholder="Mapbox token" />
-              <span style={{ opacity:0.7, fontSize:12 }}>Token is client-side; rotate if publishing.</span>
-            </>
-          )}
-        </div>
-
-        {/* Overlays */}
-        <h3 style={{ marginTop:18, marginBottom:6, opacity:0.8, fontWeight:600 }}>Overlays</h3>
-        <div className="group">
-          <label className="chip"><input type="checkbox" checked={heatOn} onChange={(e)=>setHeatOn(e.target.checked)} /><span>Speed heat coloring</span></label>
-          <label className="chip"><input type="checkbox" checked={showLegend} onChange={(e)=>setShowLegend(e.target.checked)} /><span>Mini speed bar (draggable)</span></label>
-          <div className="chip">
-            <span>Units</span>
-            <select value={units} onChange={(e)=>setUnits(e.target.value as Units)}>
-              <option value="mph">mph</option><option value="kmh">km/h</option>
-            </select>
-          </div>
-          <label className="chip"><input type="checkbox" checked={splitsOn} onChange={(e)=>setSplitsOn(e.target.checked)} /><span>Split markers + pulse</span></label>
-          <label className="chip"><input type="checkbox" checked={showTitle} onChange={(e)=>setShowTitle(e.target.checked)} /><span>Show title</span></label>
-          <input className="chip" style={{ minWidth:160, background:"rgba(255,255,255,0.06)", color:"#fff" }}
-                 value={titleText} onChange={(e)=>setTitleText(e.target.value)} placeholder="Custom title (optional)" />
-          <div className="chip">
-            <span>Title align</span>
-            <select value={titleAlign} onChange={(e)=>setTitleAlign(e.target.value as any)}>
-              <option value="left">Left</option><option value="center">Center</option><option value="right">Right</option>
-            </select>
-          </div>
-          <label className="chip"><input type="checkbox" checked={showWeather} onChange={(e)=>setShowWeather(e.target.checked)} /><span>Weather (historical in HUD)</span></label>
-        </div>
-
-        {/* Export */}
-        <h3 style={{ marginTop:18, marginBottom:6, opacity:0.8, fontWeight:600 }}>Export</h3>
-        <div className="group">
-          <div className="chip">
-            <span>Quality</span>
-            <select value={quality} onChange={(e)=>setQuality(e.target.value as Quality)}>
-              <option value="fast">Fast (MPEG-4)</option><option value="high">High (H.264)</option>
-            </select>
-          </div>
-          <button className="btn btn-primary" onClick={exportMp4} disabled={!samples.length || loadingFfmpeg}>
-            {loadingFfmpeg ? "Loading encoder…" : "Export MP4"}
-          </button>
-          <button className="btn btn-ghost" onClick={cancelExport}>Cancel</button>
-        </div>
-
-        <p style={{ marginTop:8, minHeight:24, opacity:0.85 }}>{status}</p>
-        {phase && (
-          <div style={{ marginTop:8, width:"100%", maxWidth:600 }}>
-            <div style={{ fontSize:12, opacity:.8, marginBottom:6 }}>
-              {phase==="frames" ? "Preparing frames…" : "Encoding video…"} {Math.round(progress*100)}%
             </div>
-            <div style={{ height:10, background:"rgba(255,255,255,0.12)", borderRadius:6, overflow:"hidden" }}>
-              <div style={{ height:"100%", width:`${Math.round(progress*100)}%`, background:"#22d3ee" }} />
-            </div>
+            {map3dError && (
+              <p style={{ color:"#f43f5e", marginTop:8, fontSize:14 }}>{map3dError}</p>
+            )}
           </div>
         )}
 
-        {/* Preview */}
-        <div className="panel" style={{ marginTop:12, display:"grid", placeItems:"center" }}>
-          <canvas
-            ref={canvasRef}
-            width={W}
-            height={H}
-            onPointerDown={onPointerDown}
-            onPointerMove={onPointerMove}
-            onPointerUp={onPointerUp}
-            onPointerLeave={onPointerUp}
-            onClick={onCanvasClick}
-            style={{ width:previewSize.w, height:previewSize.h, borderRadius:12, cursor:"grab" }}
-          />
-          <p style={{ marginTop:10, opacity:0.7 }}>Preview (click to {pausedRef.current ? "play" : "pause"}, drag to reposition, use Zoom). Export is {labelSuffix}.</p>
-        </div>
+        {mode === '2d' && (
+          <>
+            {/* Visual */}
+            <h3 style={{ marginTop:18, marginBottom:6, opacity:0.8, fontWeight:600 }}>Visual</h3>
+            <div className="group">
+              <div className="chip">
+                <span>Layout</span>
+                <select value={layout} onChange={(e)=>setLayout(e.target.value as Layout)}>
+                  <option value="grid">Night grid</option>
+                  <option value="minimal">Minimal dark</option>
+                  <option value="paper">Paper topo</option>
+                  <option value="transparent">Transparent (upload bg)</option>
+                  <option value="map">Map (Mapbox static)</option>
+                </select>
+              </div>
+
+              <div className="chip" style={{ gap:12 }}>
+                <span>Zoom</span>
+                <input className="range" type="range" min={0.5} max={2} step={0.05} value={zoom} onChange={(e)=>setZoom(parseFloat(e.target.value))} />
+              </div>
+
+              <label className="chip"><input type="checkbox" checked={highContrastRoute} onChange={(e)=>setHighContrastRoute(e.target.checked)} /><span>High-contrast route</span></label>
+
+              {layout === 'transparent' && (
+                <>
+                  <div className="chip">
+                    <span>Background</span>
+                    <select value={bgKind} onChange={(e)=>setBgKind(e.target.value as any)}>
+                      <option value="none">None</option><option value="image">Image</option><option value="video">Video</option>
+                    </select>
+                  </div>
+                  {bgKind === 'image' && (
+                    <label className="chip" style={{ cursor:"pointer" }}>
+                      <input type="file" accept="image/*" style={{ display:"none" }}
+                        onChange={(e)=>{
+                          const f=e.target.files?.[0]; if(!f) return;
+                          const url=URL.createObjectURL(f);
+                          const img=new Image();
+                          img.onload=()=>{ bgImgRef.current=img; setBgTick(t=>t+1); };
+                          img.src=url;
+                        }} />
+                      <span>Upload image</span>
+                    </label>
+                  )}
+                  {bgKind === 'video' && (
+                    <label className="chip" style={{ cursor:"pointer" }}>
+                      <input type="file" accept="video/*" style={{ display:"none" }}
+                        onChange={(e)=>{
+                          const f=e.target.files?.[0]; if(!f) return;
+                          const url=URL.createObjectURL(f);
+                          const v=document.createElement("video");
+                          v.src=url; v.crossOrigin="anonymous"; v.muted=true; v.loop=true; v.playsInline=true;
+                          v.onloadeddata=()=>{ bgVidRef.current=v; setBgVidReady(true); setBgTick(t=>t+1); v.play().catch(()=>{}); };
+                        }} />
+                      <span>Upload video</span>
+                    </label>
+                  )}
+                  <div className="chip" style={{ gap:12 }}>
+                    <span>Background transparency</span>
+                    <input className="range" type="range" min={0} max={1} step={0.05} value={bgAlpha} onChange={(e)=>setBgAlpha(parseFloat(e.target.value))} />
+                  </div>
+                </>
+              )}
+
+              {layout === 'map' && (
+                <>
+                  {/* Map static parameters */}
+                  <div className="chip">
+                    <span>Map style</span>
+                    <select value={mapStyle} onChange={(e) => setMapStyle(e.target.value)}>
+                      <option value="streets-v12">Streets</option>
+                      <option value="outdoors-v12">Outdoors</option>
+                      <option value="satellite-streets-v12">Satellite streets</option>
+                      <option value="satellite-v9">Satellite</option>
+                      <option value="light-v11">Light</option>
+                      <option value="dark-v11">Dark</option>
+                    </select>
+                  </div>
+                  <input type="text" className="chip" style={{ minWidth:220, background:"rgba(255,255,255,0.06)", color:"#fff" }}
+                         value={mapToken} onChange={(e)=>setMapToken(e.target.value)} placeholder="Mapbox token" />
+                  <span style={{ opacity:0.7, fontSize:12 }}>Token is client-side; rotate if publishing.</span>
+                </>
+              )}
+            </div>
+          </>
+        )}
+
+        {mode === '2d' && (
+          <>
+            {/* Overlays */}
+            <h3 style={{ marginTop:18, marginBottom:6, opacity:0.8, fontWeight:600 }}>Overlays</h3>
+            <div className="group">
+              <label className="chip"><input type="checkbox" checked={heatOn} onChange={(e)=>setHeatOn(e.target.checked)} /><span>Speed heat coloring</span></label>
+              <label className="chip"><input type="checkbox" checked={showLegend} onChange={(e)=>setShowLegend(e.target.checked)} /><span>Mini speed bar (draggable)</span></label>
+              <div className="chip">
+                <span>Units</span>
+                <select value={units} onChange={(e)=>setUnits(e.target.value as Units)}>
+                  <option value="mph">mph</option><option value="kmh">km/h</option>
+                </select>
+              </div>
+              <label className="chip"><input type="checkbox" checked={splitsOn} onChange={(e)=>setSplitsOn(e.target.checked)} /><span>Split markers + pulse</span></label>
+              <label className="chip"><input type="checkbox" checked={showTitle} onChange={(e)=>setShowTitle(e.target.checked)} /><span>Show title</span></label>
+              <input className="chip" style={{ minWidth:160, background:"rgba(255,255,255,0.06)", color:"#fff" }}
+                     value={titleText} onChange={(e)=>setTitleText(e.target.value)} placeholder="Custom title (optional)" />
+              <div className="chip">
+                <span>Title align</span>
+                <select value={titleAlign} onChange={(e)=>setTitleAlign(e.target.value as any)}>
+                  <option value="left">Left</option><option value="center">Center</option><option value="right">Right</option>
+                </select>
+              </div>
+              <label className="chip"><input type="checkbox" checked={showWeather} onChange={(e)=>setShowWeather(e.target.checked)} /><span>Weather (historical in HUD)</span></label>
+            </div>
+
+            {/* Export */}
+            <h3 style={{ marginTop:18, marginBottom:6, opacity:0.8, fontWeight:600 }}>Export</h3>
+            <div className="group">
+              <div className="chip">
+                <span>Quality</span>
+                <select value={quality} onChange={(e)=>setQuality(e.target.value as Quality)}>
+                  <option value="fast">Fast (MPEG-4)</option><option value="high">High (H.264)</option>
+                </select>
+              </div>
+              <button className="btn btn-primary" onClick={exportMp4} disabled={!samples.length || loadingFfmpeg}>
+                {loadingFfmpeg ? "Loading encoder…" : "Export MP4"}
+              </button>
+              <button className="btn btn-ghost" onClick={cancelExport}>Cancel</button>
+            </div>
+            <p style={{ marginTop:8, minHeight:24, opacity:0.85 }}>{status}</p>
+            {phase && (
+              <div style={{ marginTop:8, width:"100%", maxWidth:600 }}>
+                <div style={{ fontSize:12, opacity:.8, marginBottom:6 }}>
+                  {phase === "frames" ? "Preparing frames…" : "Encoding video…"} {Math.round(progress*100)}%
+                </div>
+                <div style={{ height:10, background:"rgba(255,255,255,0.12)", borderRadius:6, overflow:"hidden" }}>
+                  <div style={{ height:"100%", width:`${Math.round(progress*100)}%`, background:"#22d3ee" }} />
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
       </div>
     </main>
   );
